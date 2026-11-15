@@ -434,18 +434,9 @@ class ClauseBankCudaDevice:
 
     def prepare_X(self, X):
         self._ensure_context()
-        encoded_X = tmu.tools.encode(
-            X,
-            X.shape[0],
-            self.coordinator.number_of_patches,
-            self.coordinator.host.number_of_ta_chunks,
-            self.coordinator.dim,
-            self.coordinator.patch_dim,
-            0
-        )
-        encoded_X_gpu = self._profiler.profile(cuda.mem_alloc, encoded_X.nbytes)
-        self._profiler.profile(cuda.memcpy_htod, encoded_X_gpu, encoded_X)
-        return encoded_X_gpu
+        from tmu.util.patch_encoding import stage_patches
+        return stage_patches(X, self.coordinator.dim, self.coordinator.patch_dim, cuda,
+                             self.coordinator.image_invariance, self.coordinator.patch_invariance)
 
     def prepare_X_autoencoder(self, X_csr, X_csc, active_output):
         X_csr_indptr_gpu = self._profiler.profile(cuda.mem_alloc, X_csr.indptr.nbytes)
@@ -528,6 +519,8 @@ class ClauseBankCuda(BaseClauseBank):
         # Initialize host part
         self.host = ClauseBankCudaHost(seed, number_of_state_bits_ta, **kwargs)
         # Copy additional attributes for easier access
+        self.image_invariance = self.host.image_invariance
+        self.patch_invariance = self.host.patch_invariance
         self.number_of_clauses = self.host.number_of_clauses
         self.number_of_literals = self.host.number_of_literals
         self.number_of_ta_chunks = self.host.number_of_ta_chunks
@@ -610,7 +603,9 @@ class ClauseBankCuda(BaseClauseBank):
                 self.host.number_of_ta_chunks,
                 self.dim,
                 self.patch_dim,
-                0
+                0,
+                image_invariance=self.image_invariance,
+                patch_invariance=self.patch_invariance,
             )
 
     def prepare_X_autoencoder(self, X_csr, X_csc, active_output):

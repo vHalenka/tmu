@@ -21,6 +21,7 @@ import typing
 from tmu.models.base import MultiClauseBankMixin, MultiWeightBankMixin, TMBaseModel
 from tmu.util.encoded_data_cache import DataEncoderCache
 from tmu.util.statistics import MetricRecorder
+from tmu.clause_bank.tensor_cache import can_stage_flat
 from tmu.weight_bank import WeightBank
 import numpy as np
 import logging
@@ -60,7 +61,9 @@ class TMClassifier(TMBaseModel, MultiClauseBankMixin, MultiWeightBankMixin):
             literal_sampling=1.0,
             feedback_rate_excluded_literals=1,
             literal_insertion_state=-1,
-            seed=None
+            seed=None,
+            image_invariance="none",
+            patch_invariance="none",
     ):
         super().__init__(
             number_of_clauses,
@@ -92,7 +95,9 @@ class TMClassifier(TMBaseModel, MultiClauseBankMixin, MultiWeightBankMixin):
             literal_sampling=literal_sampling,
             feedback_rate_excluded_literals=feedback_rate_excluded_literals,
             literal_insertion_state=literal_insertion_state,
-            seed=seed
+            seed=seed,
+            image_invariance=image_invariance,
+            patch_invariance=patch_invariance,
         )
         MultiClauseBankMixin.__init__(self, seed=seed)
         MultiWeightBankMixin.__init__(self, seed=seed)
@@ -367,13 +372,13 @@ class TMClassifier(TMBaseModel, MultiClauseBankMixin, MultiWeightBankMixin):
     def _fit_tensor(self, X, Y, shuffle):
         clause_active = self.mechanism_clause_active()
         literal_active = self.mechanism_literal_active()
-        patches = int(self.clause_banks[0].number_of_patches)
-        if patches > 1:
-            device_x = self.clause_banks[0].stage_images(X)
+        bank = self.clause_banks[0]
+        if int(bank.number_of_patches) > 1 or can_stage_flat(bank):
+            device_x = bank.stage_images(X)
             encoded = np.empty(0, dtype=np.uint32)
         else:
             device_x = None
-            encoded = self.clause_banks[0].prepare_X(X)
+            encoded = bank.prepare_X(X)
         sample_index = np.arange(X.shape[0])
         if shuffle:
             self.rng.shuffle(sample_index)
@@ -408,13 +413,13 @@ class TMClassifier(TMBaseModel, MultiClauseBankMixin, MultiWeightBankMixin):
         class_ids = list(self.weight_banks.classes())
         banks = [self.clause_banks[class_id] for class_id in class_ids]
         weight_rows = [self.weight_banks[class_id].get_weights() for class_id in class_ids]
-        if int(self.clause_banks[0].number_of_patches) > 1:
-            device_x = self.clause_banks[0].stage_images(X)
-            sums = self.clause_banks[0].predict_class_sums(
+        bank = self.clause_banks[0]
+        if int(bank.number_of_patches) > 1 or can_stage_flat(bank):
+            device_x = bank.stage_images(X)
+            sums = bank.predict_class_sums(
                 class_ids, banks, weight_rows, None, device_x=device_x, n_rows=int(X.shape[0]))
         else:
-            encoded = self.clause_banks[0].prepare_X(X)
-            sums = self.clause_banks[0].predict_class_sums(class_ids, banks, weight_rows, encoded)
+            sums = bank.predict_class_sums(class_ids, banks, weight_rows, bank.prepare_X(X))
         ordered = np.column_stack([sums[:, int(class_id)] for class_id in class_ids]).astype(np.int32, copy=False)
         if clip_class_sum:
             ordered = np.clip(ordered, -self.T, self.T)

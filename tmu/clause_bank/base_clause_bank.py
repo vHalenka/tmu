@@ -3,11 +3,12 @@ import logging
 import numpy as np
 
 from tmu.tools import CFFISerializable
+from tmu.util.patch_encoding import PatchDimensions, normalize_patch_dim, is_multiscale, geometry
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class BaseClauseBank(CFFISerializable):
+class BaseClauseBank(PatchDimensions, CFFISerializable):
     clause_bank: np.ndarray
 
     def __init__(
@@ -23,8 +24,13 @@ class BaseClauseBank(CFFISerializable):
             patch_dim: typing.Union[tuple, None],
             **kwargs
     ):
+        self.image_invariance = kwargs.pop('image_invariance', 'none')
+        self.patch_invariance = kwargs.pop('patch_invariance', 'none')
+        if (self.image_invariance != 'none' or self.patch_invariance != 'none') and (patch_dim is None or len(X_shape) not in (3,4)):
+            raise ValueError('Reflection invariance requires spatial image input and explicit patch_dim')
         self._warn_unknown_arguments(**kwargs)
         assert isinstance(number_of_clauses, int)
+        patch_dim = normalize_patch_dim(patch_dim)
         assert isinstance(patch_dim, tuple) or patch_dim is None
 
         self.rng = np.random.RandomState(seed)
@@ -49,12 +55,17 @@ class BaseClauseBank(CFFISerializable):
         if self.patch_dim is None:
             self.patch_dim = (self.dim[0] * self.dim[1] * self.dim[2], 1)
 
-        self.number_of_features = int(
-            self.patch_dim[0] * self.patch_dim[1] * self.dim[2] + (self.dim[0] - self.patch_dim[0]) + (
+        if is_multiscale(self.patch_dim) or self.image_invariance != "none" or self.patch_invariance != "none":
+            if len(X_shape) not in (3, 4):
+                raise ValueError("Multiple patch sizes require spatial image input")
+            self.number_of_features, self.number_of_patches = geometry(self.dim, self.patch_dim)
+        else:
+            self.number_of_features = int(
+                self.patch_dim[0] * self.patch_dim[1] * self.dim[2] + (self.dim[0] - self.patch_dim[0]) + (
                     self.dim[1] - self.patch_dim[1]))
+            self.number_of_patches = int((self.dim[0] - self.patch_dim[0] + 1) * (self.dim[1] - self.patch_dim[1] + 1))
         self.number_of_literals = self.number_of_features * 2
 
-        self.number_of_patches = int((self.dim[0] - self.patch_dim[0] + 1) * (self.dim[1] - self.patch_dim[1] + 1))
         self.number_of_ta_chunks = int((self.number_of_literals - 1) / 32 + 1)
 
         self.max_included_literals = max_included_literals if max_included_literals else self.number_of_literals

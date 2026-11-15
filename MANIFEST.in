@@ -1,3 +1,3 @@
-recursive-include tmu/clause_bank/cuda *.cu
+recursive-include tmu/clause_bank/cuda *.cu *.cuh
 include tmu/logging_example.json
 include tmu/*.so

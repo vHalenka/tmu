@@ -19,6 +19,7 @@ import typing
 import numpy as np
 from scipy.sparse import csr_matrix
 
+from tmu.util.patch_encoding import PatchDimensions, is_multiscale
 from tmu.weight_bank import WeightBank
 from tmu.clause_bank.clause_bank import ClauseBank
 from tmu.clause_bank.clause_bank_cuda import ClauseBankCUDA
@@ -60,7 +61,7 @@ class SingleClauseBankMixin:
         pass
 
 
-class TMBaseModel:
+class TMBaseModel(PatchDimensions):
     number_of_classes: int
 
     def __init__(
@@ -98,7 +99,9 @@ class TMBaseModel:
             absorbing_include=None,
             absorbing_exclude=None,
             squared_weight_update_p=False,
-            seed=None
+            seed=None,
+            image_invariance="none",
+            patch_invariance="none",
     ):
         self.seed = seed
         self.rng = np.random.RandomState(seed)
@@ -126,6 +129,8 @@ class TMBaseModel:
         self.d = d
         self.platform = platform
         self.patch_dim = patch_dim
+        self.image_invariance = image_invariance
+        self.patch_invariance = patch_invariance
         self.feature_negation = feature_negation
         self.boost_true_positive_feedback = boost_true_positive_feedback
         self.max_included_literals = max_included_literals
@@ -231,6 +236,8 @@ class TMBaseModel:
             number_of_state_bits_ta=self.number_of_state_bits_ta,
             number_of_state_bits_ind=self.number_of_state_bits_ind,
             patch_dim=self.patch_dim,
+            image_invariance=self.image_invariance,
+            patch_invariance=self.patch_invariance,
             batch_size=self.batch_size,
             incremental=self.incremental,
             type_ia_ii_feedback_ratio=self.type_ia_ii_feedback_ratio,
@@ -254,6 +261,8 @@ class TMBaseModel:
             number_of_clauses=self.number_of_clauses,
             number_of_state_bits_ta=self.number_of_state_bits_ta,
             patch_dim=self.patch_dim,
+            image_invariance=self.image_invariance,
+            patch_invariance=self.patch_invariance,
             type_ia_ii_feedback_ratio=self.type_ia_ii_feedback_ratio,
             max_included_literals=self.max_included_literals,
             seed=self.seed,
@@ -273,6 +282,8 @@ class TMBaseModel:
             number_of_clauses=self.number_of_clauses,
             number_of_states=2 ** self.number_of_state_bits_ta,
             patch_dim=self.patch_dim,
+            image_invariance=self.image_invariance,
+            patch_invariance=self.patch_invariance,
             absorbing=self.absorbing,
             absorbing_exclude=self.absorbing_exclude,
             absorbing_include=self.absorbing_include,
@@ -290,6 +301,13 @@ class TMBaseModel:
         return ClauseBankTensorCore, clause_bank_args
 
     def build_clause_bank(self, X: np.ndarray):
+        if self.image_invariance != 'none' or self.patch_invariance != 'none':
+            if self.patch_dim is None or X.ndim not in (3, 4):
+                raise ValueError('Reflection invariance requires spatial image input and explicit patch_dim')
+            if self.platform not in ('CPU', 'GPU', 'CUDA', 'tensor'):
+                raise ValueError('Reflection invariance requires CPU, CUDA or tensor platform')
+        if is_multiscale(self.patch_dim) and self.platform not in ("CPU", "GPU", "CUDA", "tensor"):
+            raise ValueError("Multiple patch sizes require CPU, CUDA or tensor platform")
         if self.platform == "CPU":
             clause_bank_type, clause_bank_args = self._build_cpu_bank(X=X)
         elif self.platform in ["GPU", "CUDA"]:

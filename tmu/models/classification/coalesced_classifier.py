@@ -21,6 +21,7 @@ import typing
 from tmu.models.base import MultiWeightBankMixin, SingleClauseBankMixin, TMBaseModel
 from tmu.util.encoded_data_cache import DataEncoderCache
 from tmu.weight_bank import WeightBank
+from tmu.clause_bank.tensor_shared import coalesced_weight_matrix, coalesced_class_sums
 import numpy as np
 
 
@@ -47,8 +48,15 @@ class TMCoalescedClassifier(TMBaseModel, SingleClauseBankMixin, MultiWeightBankM
         weighted_clauses=False,
         clause_drop_p=0.0,
         literal_drop_p=0.0,
-        seed=None
+        seed=None,
+        batch_size=100,
+        image_invariance="none",
+        patch_invariance="none",
+        pack_batches=False,
     ):
+        if not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        self.pack_batches = bool(pack_batches)
         super().__init__(
             number_of_clauses=number_of_clauses,
             T=T,
@@ -68,7 +76,10 @@ class TMCoalescedClassifier(TMBaseModel, SingleClauseBankMixin, MultiWeightBankM
             weighted_clauses=weighted_clauses,
             clause_drop_p=clause_drop_p,
             literal_drop_p=literal_drop_p,
-            seed=seed
+            seed=seed,
+            batch_size=int(batch_size),
+            image_invariance=image_invariance,
+            patch_invariance=patch_invariance,
         )
         SingleClauseBankMixin.__init__(self)
         MultiWeightBankMixin.__init__(self, seed=seed)
@@ -215,6 +226,11 @@ class TMCoalescedClassifier(TMBaseModel, SingleClauseBankMixin, MultiWeightBankM
         )
 
     def fit(self, X, Y, shuffle=True, **kwargs):
+        if self.platform == "tensor":
+            from tmu.models.tensor_coalesced import fit, validate_training
+            validate_training(self, X, Y)
+            self.init(X, Y)
+            return fit(self, X, Y, shuffle)
         self.init(X, Y)
 
         encoded_X_train = self.train_encoder_cache.get_encoded_data(
@@ -272,20 +288,28 @@ class TMCoalescedClassifier(TMBaseModel, SingleClauseBankMixin, MultiWeightBankM
                     self.update(Ym[batch_example], batch_example, encoded_X_train)
         return
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_coalesced_gpu", None)
+        return state
+
     def predict(self, X, clip_class_sum=False, return_class_sums: bool = False, **kwargs):
+        if self.platform == "tensor":
+            from tmu.models.tensor_coalesced import predict
+            return predict(self, X, clip_class_sum, return_class_sums)
 
         # Caching the encoded test set if it's not cached already
         if not np.array_equal(self.X_test, X):
             self.encoded_X_test = self.clause_bank.prepare_X(X)
             self.X_test = X.copy()
 
-        # Compute class sums for all samples
+        weights = coalesced_weight_matrix(self) if X.shape[0] else None
         class_sums = np.array([
-            self.compute_class_sums(
-                encoded_X_test=self.encoded_X_test,
-                ith_sample=e,
-                clip_class_sum=clip_class_sum
-            ) for e in range(X.shape[0])
+            self.compute_class_sums(encoded_X_test=self.encoded_X_test,
+                                    ith_sample=e, clip_class_sum=clip_class_sum)
+            if weights is None else
+            coalesced_class_sums(self, self.encoded_X_test, e, clip_class_sum, weights)
+            for e in range(X.shape[0])
         ])
 
         # Find the class with the maximum sum for each sample
@@ -316,6 +340,7 @@ class TMCoalescedClassifier(TMBaseModel, SingleClauseBankMixin, MultiWeightBankM
             class_sums.append(class_sum)
         return class_sums
 
+    _compute_class_sums_default = compute_class_sums
 
     """def predict(self, X, clip_class_sum=False, return_class_sums: bool = False, **kwargs):
         if not np.array_equal(self.X_test, X):

@@ -24,6 +24,7 @@ import numpy as np
 
 import tmu.tools
 from tmu.clause_bank.base_clause_bank import BaseClauseBank
+from tmu.clause_bank.tensor_cache import array_key, cached_upload
 from tmu.clause_bank.clause_bank_cuda import load_cuda_kernel
 
 try:
@@ -338,6 +339,7 @@ def _commit_device_epoch(class_ids, banks, weights, packed_weights):
     for row, class_id in enumerate(class_ids):
         weights[row][:] = packed_weights[int(class_id)]
         banks[row]._host_valid = False
+        banks[row]._prediction_generation = getattr(banks[row], "_prediction_generation", 0) + 1
 
 
 def validate_tensor_core_configuration(
@@ -482,6 +484,8 @@ class ClauseBankTensorCore(BaseClauseBank):
         self._x_bytes = 0
         self._tc_scratch = {}
         self._enc_cache = None
+        self._prediction_generation = 0
+        self._prediction_identity = object()
         mod = _tc_module()
         self._ex_fn = mod.get_function("tc_extract")
         self._ex_fn.prepare("PPPPPiiiiIi")
@@ -513,8 +517,8 @@ class ClauseBankTensorCore(BaseClauseBank):
         transient = {
             "_ta_gpu", "_x_gpu", "_x_bytes", "_tc_scratch", "_enc_cache",
             "_ex_fn", "_gather_fn", "_imma_fn", "_bmma_fn", "_reduce_fn", "_fb_fn",
-            "_encode_fn", "_or_fn", "_conv_fn", "_conv_live_fn",
-            "_runtime", "_profile_enabled", "_timings",
+            "_coalesced_predict_kernels", "_encode_fn", "_or_fn", "_conv_fn", "_conv_live_fn",
+            "_runtime", "_profile_enabled", "_timings", "_prediction_generation", "_prediction_identity",
         }
         return {key: value for key, value in self.__dict__.items() if key not in transient}
 
@@ -540,6 +544,7 @@ class ClauseBankTensorCore(BaseClauseBank):
             if not self._host_valid:
                 return
             cuda.memcpy_htod(self._ta_gpu, self.clause_bank)
+            self._prediction_generation = getattr(self, "_prediction_generation", 0) + 1
             self._host_newer = False
 
     def _pull(self):
@@ -549,16 +554,15 @@ class ClauseBankTensorCore(BaseClauseBank):
 
     def _upload_x(self, encoded_X):
         encoded = np.ascontiguousarray(encoded_X, dtype=np.uint32)
-        if self._x_gpu is None or self._x_bytes < encoded.nbytes:
-            self._x_gpu = cuda.mem_alloc(encoded.nbytes)
-            self._x_bytes = encoded.nbytes
-        cuda.memcpy_htod(self._x_gpu, encoded)
+        self._x_gpu = cached_upload(self, "encoded_x", encoded, cuda)
+        self._x_bytes = max(self._x_bytes, encoded.nbytes)
         return self._x_gpu
 
     def set_ta_state(self, clause, ta, state):
         if not self._host_valid:
             self._pull()
         super().set_ta_state(clause, ta, state)
+        self._prediction_generation = getattr(self, "_prediction_generation", 0) + 1
         self._host_newer = True
         self._host_valid = True
 
@@ -609,18 +613,32 @@ class ClauseBankTensorCore(BaseClauseBank):
         return frequency
 
     def calculate_clause_outputs_patchwise(self, encoded_X, e):
-        return self.calculate_clause_outputs_predict(encoded_X, e)
+        self._require_imma()
+        _ensure_context()
+        self._push()
+        clauses, chunks, patches = self.number_of_clauses, self.number_of_ta_chunks, self.number_of_patches
+        ptrs = cached_upload(self, "patchwise_ptrs", np.array([int(self._ta_gpu)], np.uint64), cuda)
+        literal = cached_upload(self, "patchwise_literals", np.full(chunks, 0xffffffff, np.uint32), cuda)
+        weights = cached_upload(self, "patchwise_weights", np.ones(clauses, np.int32), cuda)
+        masks = self._tc_buf("patchwise_masks", clauses * chunks * 4)
+        counts = self._tc_buf("patchwise_counts", clauses * 4)
+        included = self._tc_buf("patchwise_included", clauses * 4)
+        self._extract(ptrs, literal, masks, counts, included, 1, 0)
+        encoded = np.ascontiguousarray(encoded_X[e], dtype=np.uint32).reshape(patches, chunks)
+        data = self._upload_x(encoded)
+        outputs = self._tc_buf("patchwise_outputs", clauses * patches)
+        sums = self._tc_buf("patchwise_sums", patches * 4)
+        self._imma(data, masks, counts, weights, outputs, sums, patches, 1, 0, 1)
+        result = np.empty((clauses, patches), np.uint8)
+        cuda.memcpy_dtoh(result, outputs)
+        return result.astype(np.uint32).reshape(-1)
 
     def prepare_X(self, X):
-        return tmu.tools.encode(
-            np.ascontiguousarray(X),
-            int(X.shape[0]),
-            int(self.number_of_patches),
-            int(self.number_of_ta_chunks),
-            self.dim,
-            self.patch_dim,
-            0,
-        )
+        # Public callers receive host data, but the encoding itself runs on GPU.
+        result = np.empty((len(X), self.number_of_patches * self.number_of_ta_chunks), np.uint32)
+        if len(X):
+            cuda.memcpy_dtoh(result, self.stage_images(X))
+        return result
 
     def _tc_buf(self, name, nbytes):
         current = self._tc_scratch.get(name)
@@ -913,10 +931,19 @@ class ClauseBankTensorCore(BaseClauseBank):
         convolutional patch.
         """
         raw = np.ascontiguousarray(X, dtype=np.uint32)
-        key = (int(raw.ctypes.data), tuple(raw.shape), int(raw.nbytes))
+        key = array_key(raw)
         cached = getattr(self, "_enc_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
+        from tmu.util.patch_encoding import is_multiscale, stage_patches
+        if is_multiscale(self.patch_dim) or self.image_invariance != "none" or self.patch_invariance != "none":
+            self._require_imma()
+            _ensure_context()
+            options = {} if self.image_invariance == self.patch_invariance == 'none' else dict(
+                image_invariance=self.image_invariance, patch_invariance=self.patch_invariance)
+            encoded_gpu = stage_patches(raw, self.dim, self.patch_dim, cuda, **options)
+            self._enc_cache = (key, encoded_gpu, raw.shape[0] * self.number_of_patches * self.number_of_ta_chunks * 4)
+            return encoded_gpu
         dim_x, dim_y, dim_z = (int(v) for v in self.dim)
         patch_w, patch_h = int(self.patch_dim[0]), int(self.patch_dim[1])
         features = patch_w * patch_h * dim_z + (dim_x - patch_w) + (dim_y - patch_h)
@@ -931,6 +958,9 @@ class ClauseBankTensorCore(BaseClauseBank):
         self._require_imma()
         _ensure_context()
         encoded_gpu = cuda.mem_alloc(max(nbytes, 4))
+        if n == 0:
+            self._enc_cache = (key, encoded_gpu, nbytes)
+            return encoded_gpu
         raw_gpu = self._tc_buf("raw_images", raw.nbytes)
         cuda.memcpy_htod(raw_gpu, np.ascontiguousarray(raw.reshape(n, -1)))
         jobs = n * n_patches
@@ -1141,11 +1171,11 @@ class ClauseBankTensorCore(BaseClauseBank):
             # One image per step. Every patch of that image shares the mask,
             # and the next image sees the updated automata.
             feedback_batch_size = 1
-        if per_image:
-            tgt_all = self._tc_buf("tgt", targets.nbytes)
-            neg_all = self._tc_buf("neg", not_targets.nbytes)
-            cuda.memcpy_htod(tgt_all, targets)
-            cuda.memcpy_htod(neg_all, not_targets)
+        schedule = np.concatenate((sample_index, targets, not_targets))
+        schedule_gpu = cached_upload(self, "epoch_schedule", schedule, cuda)
+        schedule_bytes = sample_index.nbytes
+        tgt_all = int(schedule_gpu) + schedule_bytes
+        neg_all = int(schedule_gpu) + 2 * schedule_bytes
         for start in range(0, len(sample_index), feedback_batch_size):
             stop = min(start + feedback_batch_size, len(sample_index))
             n = stop - start
@@ -1158,12 +1188,9 @@ class ClauseBankTensorCore(BaseClauseBank):
                 neg_gpu = int(neg_all) + start * 4
                 batch_x = int(device_x) + int(idx[0]) * row_stride * 4
             else:
-                idx_gpu = self._tc_buf("idx", idx.nbytes)
-                tgt_gpu = self._tc_buf("tgt", tgt.nbytes)
-                neg_gpu = self._tc_buf("neg", neg.nbytes)
-                cuda.memcpy_htod(idx_gpu, idx)
-                cuda.memcpy_htod(tgt_gpu, tgt)
-                cuda.memcpy_htod(neg_gpu, neg)
+                idx_gpu = int(schedule_gpu) + start * 4
+                tgt_gpu = int(tgt_all) + start * 4
+                neg_gpu = int(neg_all) + start * 4
                 batch_x = self._tc_buf("batch_x", n * row_stride * 4)
                 self._time_call(
                     "gather",
@@ -1287,7 +1314,7 @@ class ClauseBankTensorCore(BaseClauseBank):
             "update_p_not_target": not_target_update_p,
         }
 
-    def predict_class_sums(self, class_ids, banks, weights, encoded, device_x=None, n_rows=None):
+    def predict_class_sums(self, class_ids, banks, weights, encoded, device_x=None, n_rows=None, preserve_rng=False):
         self._require_imma()
         _ensure_context()
         for bank in banks:
@@ -1303,24 +1330,22 @@ class ClauseBankTensorCore(BaseClauseBank):
         n_slots, ta_ptrs, packed_w, _packed_active = self._pack_slots(
             class_ids, banks, weights, np.ones(n_clauses, dtype=np.int32))
         literal = np.full(chunks, np.uint32(0xFFFFFFFF))
-        ptrs_gpu = self._tc_buf("ptrs", ta_ptrs.nbytes)
-        cuda.memcpy_htod(ptrs_gpu, ta_ptrs)
-        w_gpu = self._tc_buf("weights", packed_w.nbytes)
-        cuda.memcpy_htod(w_gpu, packed_w)
-        lit_gpu = self._tc_buf("lit", literal.nbytes)
-        cuda.memcpy_htod(lit_gpu, literal)
-        masks_gpu = self._tc_buf("masks", self._mask_bytes(n_slots))
-        counts_gpu = self._tc_buf("counts", max(n_slots * n_clauses * 4, 4))
-        included_counts_gpu = self._tc_buf("included_counts", max(n_slots * n_clauses * 4, 4))
-        self._extract(
-            ptrs_gpu,
-            lit_gpu,
-            masks_gpu,
-            counts_gpu,
-            included_counts_gpu,
-            n_slots,
-            0,
-        )
+        ptrs_gpu = cached_upload(self, "predict_ptrs", ta_ptrs, cuda)
+        w_gpu = cached_upload(self, "predict_weights", packed_w, cuda)
+        lit_gpu = cached_upload(self, "predict_literals", literal, cuda)
+        masks_gpu = self._tc_buf("predict_masks", self._mask_bytes(n_slots))
+        counts_gpu = self._tc_buf("predict_counts", max(n_slots * n_clauses * 4, 4))
+        included_counts_gpu = self._tc_buf("predict_included_counts", max(n_slots * n_clauses * 4, 4))
+        for bank in banks:
+            if not hasattr(bank, "_prediction_identity"):
+                bank._prediction_identity = object()
+        state_key = (tuple(class_ids), tuple((bank._prediction_identity, int(bank._ta_gpu),
+                     getattr(bank, "_prediction_generation", 0)) for bank in banks))
+        if self._tc_scratch.get("predict_state") != state_key:
+            self._tc_scratch.pop("predict_state", None)
+            self._extract(ptrs_gpu, lit_gpu, masks_gpu, counts_gpu,
+                          included_counts_gpu, n_slots, 0)
+            self._tc_scratch["predict_state"] = state_key
         fired_gpu = self._tc_buf("fired_dummy", 4)
         sums = np.empty((n, n_slots), dtype=np.int32)
         if n == 0:
@@ -1333,13 +1358,16 @@ class ClauseBankTensorCore(BaseClauseBank):
             row_limit = min(row_limit, max(1, (256 * 1024 * 1024) // max(per_image, 1)))
         elif patches > 1:
             row_limit = min(row_limit, 2048, int(getattr(runtime, "max_grid_z", 65535)))
+        # Coalesced CPU inference preserves bank RNG. Vanilla keeps its legacy
+        # draw progression because later Tensor training depends on that state.
         for start in range(0, n, row_limit):
             stop = min(start + row_limit, n)
             images = stop - start
             batch_sums = np.empty((images, n_slots), dtype=np.int32)
             sums_gpu = self._tc_buf("sums", batch_sums.nbytes)
             if patches == 1:
-                x_gpu = self._upload_x(np.ascontiguousarray(encoded[start:stop]))
+                x_gpu = (int(device_x) + start * chunks * 4 if device_x is not None
+                         else self._upload_x(np.ascontiguousarray(encoded[start:stop])))
                 self._imma(
                     x_gpu,
                     masks_gpu,
@@ -1367,7 +1395,7 @@ class ClauseBankTensorCore(BaseClauseBank):
                     self._conv_match(
                         x_ptr, masks_gpu, counts_gpu, w_gpu, fired_or_gpu, patch_gpu, sums_gpu,
                         images, n_slots, patches, 1,
-                        int(self.rng.randint(1, 2**31 - 1)), 0,
+                        1 if preserve_rng else int(self.rng.randint(1, 2**31 - 1)), 0,
                     )
                 else:
                     patch_fired_gpu = self._tc_buf("fired", n_slots * n_clauses * images * patches)
@@ -1380,9 +1408,12 @@ class ClauseBankTensorCore(BaseClauseBank):
                     fired_or_gpu = self._tc_buf("fired_or", n_slots * n_clauses * images)
                     self._or_patches(
                         patch_fired_gpu, w_gpu, fired_or_gpu, patch_gpu, sums_gpu,
-                        images, n_slots, int(self.rng.randint(1, 2**31 - 1)),
+                        images, n_slots, 1 if preserve_rng else int(self.rng.randint(1, 2**31 - 1)),
                     )
             _CTX.synchronize()
             cuda.memcpy_dtoh(batch_sums, sums_gpu)
             sums[start:stop] = batch_sums
         return sums
+
+    _prepare_X_default = prepare_X
+    _stage_images_default = stage_images

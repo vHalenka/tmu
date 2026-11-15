@@ -398,7 +398,9 @@ class ClauseBank(BaseClauseBank):
             self.number_of_ta_chunks,
             self.dim,
             self.patch_dim,
-            0
+            0,
+            image_invariance=self.image_invariance,
+            patch_invariance=self.patch_invariance,
         )
 
     def prepare_X_autoencoder(

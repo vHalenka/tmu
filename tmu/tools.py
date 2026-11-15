@@ -99,8 +99,19 @@ def encode(
         dim,
         patch_dim,
         class_features,
-        append_negated=True
+        append_negated=True,
+        image_invariance="none",
+        patch_invariance="none",
 ):
+
+    from tmu.util.patch_encoding import is_multiscale, encode_cpu
+    if is_multiscale(patch_dim) or image_invariance != "none" or patch_invariance != "none":
+        if class_features:
+            raise ValueError("Multiple patch sizes and reflection invariance do not support class_features")
+        encoded = encode_cpu(X, dim, patch_dim, append_negated, image_invariance, patch_invariance)
+        if encoded.shape != (number_of_examples, number_of_patches * number_of_ta_chunks):
+            raise ValueError("Encoded patch geometry does not match the allocated clause bank")
+        return encoded
 
     Xm = np.ascontiguousarray(X.flatten()).astype(np.uint32)
     encoded_X = np.ascontiguousarray(
